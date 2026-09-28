@@ -9,7 +9,6 @@ import pandas as pd
 import torch
 from anndata import AnnData
 from scipy.stats import norm
-from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
 
 from scviva.tools.harreman.hotspot import models
@@ -19,7 +18,14 @@ from scviva.tools.harreman.preprocessing.anndata import (
 from scviva.utils import resolve_device, stats_dtype
 
 from ._metabolite_scoring import compute_metabolite_cs_ct
-from ._stats import compute_max_cs, flatten, z_to_pval_fdr
+from ._stats import (
+    bh_over_tested,
+    check_pval_ties,
+    compute_max_cs,
+    flatten,
+    permutation_exceedances,
+    z_to_pval_fdr,
+)
 
 
 def _make_hashable(pair: tuple[Any, Any]) -> tuple[Any, Any]:
@@ -44,6 +50,8 @@ def compute_ct_cell_communication(
     check_analytic_null: bool | None = False,
     device: torch.device | str = "auto",
     verbose: bool | None = False,
+    pval_ties: Literal["inclusive", "strict"] = "inclusive",
+    min_cells_per_cell_type: int | None = None,
 ) -> None:
     """Compute cell type-aware cell-cell communication scores.
 
@@ -95,6 +103,22 @@ def compute_ct_cell_communication(
         PyTorch device to run computations on. Defaults to CUDA if available.
     verbose : bool, optional (default: False)
         Whether to print progress and status messages.
+    pval_ties : {'inclusive', 'strict'}, optional (default: 'inclusive')
+        How the non-parametric test counts permuted scores equal to the observed score.
+        ``'inclusive'`` gives the standard permutation p-value, (#(perm >= obs) + 1) / (M + 1).
+        ``'strict'`` counts only perm > obs, the behavior up to scviva-tools 0.1.7: interactions
+        with no co-expression (observed and permuted scores all 0) then get the minimum p-value,
+        which inflates significance. Use it only to reproduce earlier results.
+    min_cells_per_cell_type : int, optional (default: None)
+        Expression filter for the non-parametric test. If set, a gene pair is tested for a cell
+        type pair only if its first gene is detected (value > 0 in ``layer_key_np_test``) in at
+        least this many cells of the first cell type and its second gene in at least this many
+        cells of the second cell type (every subunit of a heteromeric complex). A metabolite is
+        tested if at least one of its gene pairs is. FDRs are computed over the tested entries
+        only; untested entries get NaN p-values and FDRs. The detection counts depend only on
+        cell-type labels, which the within-cell-type permutation preserves, so the filter does not
+        bias the test.
+        ``None`` (default) tests every gene pair and metabolite.
 
     Returns
     -------
@@ -124,6 +148,10 @@ def compute_ct_cell_communication(
     if mean not in ["algebraic", "geometric"]:
         raise ValueError('The "mean" variable should be one of ["algebraic", "geometric"].')
 
+    check_pval_ties(pval_ties)
+    if min_cells_per_cell_type is not None and min_cells_per_cell_type < 1:
+        raise ValueError('"min_cells_per_cell_type" should be a positive integer or None.')
+
     if "cell_type_key" in adata.uns and cell_type_key is None:
         cell_type_key = adata.uns["cell_type_key"]
     elif "cell_type_key" not in adata.uns and cell_type_key is None:
@@ -135,6 +163,8 @@ def compute_ct_cell_communication(
     adata.uns["cell_type_key"] = cell_type_key
     adata.uns["center_counts_for_np_test"] = center_counts_for_np_test
     adata.uns["mean"] = mean
+    adata.uns["pval_ties"] = pval_ties
+    adata.uns["min_cells_per_cell_type"] = min_cells_per_cell_type
 
     run_ct_cell_communication_analysis(
         adata,
@@ -153,6 +183,8 @@ def compute_ct_cell_communication(
         check_analytic_null,
         device,
         verbose,
+        pval_ties=pval_ties,
+        min_cells_per_cell_type=min_cells_per_cell_type,
     )
 
     if verbose:
@@ -197,6 +229,8 @@ def run_ct_cell_communication_analysis(
     check_analytic_null: bool | None,
     device: torch.device | str,
     verbose: bool | None,
+    pval_ties: Literal["inclusive", "strict"] = "inclusive",
+    min_cells_per_cell_type: int | None = None,
 ) -> None:
     """Run the cell type-aware CCC score and significance workflow."""
     # Cell metadata/obs_names never differ between `adata` and `adata.raw`,
@@ -229,6 +263,8 @@ def run_ct_cell_communication_analysis(
         cell_types = cell_types.loc[cells]
 
     adata.uns["cells"] = cells
+    # per-sample standardization indexes cells by position, so it needs the analysed cells only
+    adata_cells = adata if len(cells) == adata.n_obs else adata[cells, :]
 
     weights_ct_pairs = create_weights_ct_pairs(
         weights.tocoo(), cell_types, cell_type_pairs, device
@@ -370,10 +406,10 @@ def run_ct_cell_communication_analysis(
         counts_2 = torch.stack(counts_2)
 
         counts_1 = standardize_ct_counts(
-            adata, counts_1, model, num_umi, sample_specific, cell_types
+            adata_cells, counts_1, model, num_umi, sample_specific, cell_types
         )
         counts_2 = standardize_ct_counts(
-            adata, counts_2, model, num_umi, sample_specific, cell_types
+            adata_cells, counts_2, model, num_umi, sample_specific, cell_types
         )
 
         # Compute CCC scores
@@ -477,10 +513,10 @@ def run_ct_cell_communication_analysis(
         if center_counts_for_np_test:
             num_umi = counts.sum(dim=0)
             counts_1 = standardize_ct_counts(
-                adata, counts_1, model, num_umi, sample_specific, cell_types
+                adata_cells, counts_1, model, num_umi, sample_specific, cell_types
             )
             counts_2 = standardize_ct_counts(
-                adata, counts_2, model, num_umi, sample_specific, cell_types
+                adata_cells, counts_2, model, num_umi, sample_specific, cell_types
             )
 
         if center_counts_for_np_test and test == "both":
@@ -589,27 +625,44 @@ def run_ct_cell_communication_analysis(
         adata.uns["ct_ccc_results"]["np"]["m"]["perm_cs"] = perm_cs_m.detach().cpu().numpy()
 
         x_gp = np.sum(
-            adata.uns["ct_ccc_results"]["np"]["gp"]["perm_cs"]
-            > adata.uns["ct_ccc_results"]["np"]["gp"]["cs"][:, :, np.newaxis],
+            permutation_exceedances(
+                adata.uns["ct_ccc_results"]["np"]["gp"]["perm_cs"],
+                adata.uns["ct_ccc_results"]["np"]["gp"]["cs"][:, :, np.newaxis],
+                pval_ties,
+            ),
             axis=2,
         )
         x_m = np.sum(
-            adata.uns["ct_ccc_results"]["np"]["m"]["perm_cs"]
-            > adata.uns["ct_ccc_results"]["np"]["m"]["cs"][:, :, np.newaxis],
+            permutation_exceedances(
+                adata.uns["ct_ccc_results"]["np"]["m"]["perm_cs"],
+                adata.uns["ct_ccc_results"]["np"]["m"]["cs"][:, :, np.newaxis],
+                pval_ties,
+            ),
             axis=2,
         )
 
         pvals_gp = (x_gp + 1) / (M + 1)
         pvals_m = (x_m + 1) / (M + 1)
 
+        tested_gp = tested_m = None
+        if min_cells_per_cell_type is not None:
+            tested_gp, tested_m = _expression_filter_ct(
+                counts,
+                cell_types,
+                cell_type_pairs,
+                gene_pairs_ind,
+                gene_pair_dict,
+                min_cells_per_cell_type,
+            )
+            pvals_gp = np.where(tested_gp, pvals_gp, np.nan)
+            pvals_m = np.where(tested_m, pvals_m, np.nan)
+            adata.uns["ct_ccc_results"]["np"]["gp"]["tested"] = tested_gp
+            adata.uns["ct_ccc_results"]["np"]["m"]["tested"] = tested_m
+
         adata.uns["ct_ccc_results"]["np"]["gp"]["pval"] = pvals_gp
-        adata.uns["ct_ccc_results"]["np"]["gp"]["FDR"] = multipletests(
-            pvals_gp.flatten(), method="fdr_bh"
-        )[1].reshape(pvals_gp.shape)
+        adata.uns["ct_ccc_results"]["np"]["gp"]["FDR"] = bh_over_tested(pvals_gp, tested_gp)
         adata.uns["ct_ccc_results"]["np"]["m"]["pval"] = pvals_m
-        adata.uns["ct_ccc_results"]["np"]["m"]["FDR"] = multipletests(
-            pvals_m.flatten(), method="fdr_bh"
-        )[1].reshape(pvals_m.shape)
+        adata.uns["ct_ccc_results"]["np"]["m"]["FDR"] = bh_over_tested(pvals_m, tested_m)
 
         if check_analytic_null:
             adata.uns["ct_ccc_results"]["np"]["analytic_null"] = {
@@ -627,6 +680,49 @@ def run_ct_cell_communication_analysis(
     return
 
 
+def _expression_filter_ct(
+    counts: torch.Tensor,
+    cell_types: pd.Series,
+    cell_type_pairs: list[tuple[str, str]],
+    gene_pairs_ind: list[tuple[Any, Any]],
+    gene_pair_dict: dict,
+    min_cells: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Which (cell type pair, gene pair) and (cell type pair, metabolite) entries to test.
+
+    ``counts`` is the (genes x cells) matrix of the non-parametric test before any centering. The
+    first gene of a pair must be detected in >= ``min_cells`` cells of the first cell type and the
+    second gene in >= ``min_cells`` cells of the second (all subunits of a complex). A metabolite
+    is tested if any of its gene pairs is.
+    """
+    labels = np.asarray(cell_types.astype(str).values)
+    detected = counts > 0
+    n_detected = {}
+    for ct in {ct for pair in cell_type_pairs for ct in pair}:
+        mask = torch.tensor(labels == ct, device=counts.device)
+        n_detected[ct] = detected[:, mask].sum(dim=1).cpu().numpy()
+
+    def expressed(idx, ct):
+        idxs = idx if isinstance(idx, list) else [idx]
+        return all(n_detected[ct][i] >= min_cells for i in idxs)
+
+    tested_gp = np.array(
+        [
+            [expressed(idx1, ct1) and expressed(idx2, ct2) for idx1, idx2 in gene_pairs_ind]
+            for ct1, ct2 in cell_type_pairs
+        ],
+        dtype=bool,
+    ).reshape(len(cell_type_pairs), len(gene_pairs_ind))
+    tested_m = np.array(
+        [
+            [tested_gp[k, idxs].any() for idxs in gene_pair_dict.values()]
+            for k in range(len(cell_type_pairs))
+        ],
+        dtype=bool,
+    ).reshape(len(cell_type_pairs), len(gene_pair_dict))
+    return tested_gp, tested_m
+
+
 def standardize_ct_counts(
     adata: AnnData,
     counts: torch.Tensor,
@@ -641,7 +737,7 @@ def standardize_ct_counts(
         for sample in adata.obs[sample_key].unique():
             subset = np.where(adata.obs[sample_key] == sample)[0]
             counts[:, subset] = center_ct_counts_torch(
-                counts[:, subset], num_umi[subset], model, cell_types[subset]
+                counts[:, subset], num_umi[subset], model, cell_types.iloc[subset]
             )
     else:
         counts = center_ct_counts_torch(counts, num_umi, model, cell_types)
@@ -1309,6 +1405,10 @@ def get_ct_cell_communication_results(
         cell_com_df_gp[f"C_{suffix}"] = c_values.flatten()
         cell_com_df_gp[f"pval_{suffix}"] = p_values.flatten()
         cell_com_df_gp[f"FDR_{suffix}"] = fdr_values.flatten()
+        if "tested" in adata.uns["ct_ccc_results"][suffix]["gp"]:
+            cell_com_df_gp[f"tested_{suffix}"] = adata.uns["ct_ccc_results"][suffix]["gp"][
+                "tested"
+            ].flatten()
 
         counts = counts_from_anndata_for_genes(adata, genes, layer_key_np_test, dense=True)
         counts = torch.tensor(counts, dtype=stats_dtype(device), device=device)
@@ -1331,6 +1431,10 @@ def get_ct_cell_communication_results(
         cell_com_df_m[f"C_{suffix}"] = c_values.flatten()
         cell_com_df_m[f"pval_{suffix}"] = p_values.flatten()
         cell_com_df_m[f"FDR_{suffix}"] = fdr_values.flatten()
+        if "tested" in adata.uns["ct_ccc_results"][suffix]["m"]:
+            cell_com_df_m[f"tested_{suffix}"] = adata.uns["ct_ccc_results"][suffix]["m"][
+                "tested"
+            ].flatten()
 
     adata.uns["ct_ccc_results"]["cell_com_df_gp"] = cell_com_df_gp
     adata.uns["ct_ccc_results"]["cell_com_df_m"] = cell_com_df_m

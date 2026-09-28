@@ -23,6 +23,49 @@ def z_to_pval_fdr(Z: np.ndarray, method: str = "fdr_bh") -> tuple[np.ndarray, np
     return pvals, fdr
 
 
+PVAL_TIES = ("inclusive", "strict")
+
+
+def check_pval_ties(pval_ties: str) -> str:
+    """Validate the ``pval_ties`` option of the permutation tests."""
+    if pval_ties not in PVAL_TIES:
+        raise ValueError(f'"pval_ties" should be one of {list(PVAL_TIES)}, got {pval_ties!r}.')
+    return pval_ties
+
+
+def permutation_exceedances(perm: Any, observed: Any, pval_ties: str = "inclusive") -> Any:
+    """Boolean mask of permuted scores that reach the observed score.
+
+    The permutation p-value is ``(n_exceedances + 1) / (M + 1)``.
+
+    - ``"inclusive"`` (default) counts ``perm >= observed``, the standard permutation p-value.
+      A score that is matched by the null, e.g. a gene pair with no co-expression whose observed
+      and permuted scores are all exactly 0, gets p = 1.
+    - ``"strict"`` counts ``perm > observed``, the behavior of harreman / scviva-tools up to
+      0.1.7. Ties are not counted, so an all-zero score and null gives the minimum p-value
+      ``1 / (M + 1)``; kept only to reproduce earlier results.
+
+    Works for numpy arrays and torch tensors (``observed`` must broadcast against ``perm``).
+    """
+    check_pval_ties(pval_ties)
+    return perm >= observed if pval_ties == "inclusive" else perm > observed
+
+
+def bh_over_tested(pvals: np.ndarray, tested: np.ndarray | None = None) -> np.ndarray:
+    """Benjamini-Hochberg FDR over the entries marked as tested (all if ``tested`` is None).
+
+    Untested entries get ``NaN``. Shapes are preserved.
+    """
+    pvals = np.asarray(pvals, dtype=float)
+    if tested is None:
+        return multipletests(pvals.flatten(), method="fdr_bh")[1].reshape(pvals.shape)
+    tested = np.asarray(tested, dtype=bool)
+    fdr = np.full(pvals.shape, np.nan)
+    if tested.any():
+        fdr[tested] = multipletests(pvals[tested], method="fdr_bh")[1]
+    return fdr
+
+
 def flatten(nested_list: list | tuple) -> Iterator[Any]:
     """Yield scalar values from a nested list or tuple structure."""
     for item in nested_list:

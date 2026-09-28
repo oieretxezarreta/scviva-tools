@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Harreman: `min_cells_per_cell_type` option for the cell type-aware non-parametric test
+  (`compute_ct_cell_communication`, `HarremanAnalysis.compute_cell_communication(mode="cell_type")`).
+  A gene pair is tested only if its genes are detected in at least that many cells of their cell
+  types (all subunits of a complex); a metabolite is tested if any of its gene pairs is, and FDRs are
+  computed over the tested entries only. Off by default.
+- Harreman: `pval_ties` option (`"inclusive"` / `"strict"`) on `compute_cell_communication`,
+  `compute_ct_cell_communication` and `compute_interacting_cell_scores` (see *Changed*).
+
+### Changed
+
+- **Harreman permutation p-values now count ties** (`pval_ties="inclusive"`, new default):
+  p = (#(perm >= obs) + 1) / (M + 1), the standard permutation p-value. Previously only permuted
+  scores strictly greater than the observed one were counted, so interactions with no
+  co-expression at all (observed and permuted scores exactly 0) received the minimum p-value
+  1/(M + 1). With sparse cell types this concerns most gene pairs and made real interactions look
+  more significant, since BH ranked them behind thousands of such spurious minimum p-values.
+  Scores and permutation nulls are unchanged; `pval_ties="strict"` reproduces the p-values of
+  0.1.7 and earlier. Affects the non-parametric test of `compute_cell_communication`,
+  `compute_ct_cell_communication` and `compute_interacting_cell_scores`.
+
+### Fixed
+
+- Harreman: cell type-aware CCC with a `sample_key` raised `IndexError` whenever the analysed cell
+  type pairs did not cover all cells, because per-sample count standardization indexed the full
+  AnnData while the counts only held the analysed cells (`run_ct_cell_communication_analysis`
+  now passes `adata[cells, :]`, as `compute_ct_interacting_cell_scores` already did).
+
 ## [0.1.7] - 2026-09-10
 
 ### Added

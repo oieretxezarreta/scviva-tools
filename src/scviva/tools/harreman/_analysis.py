@@ -409,6 +409,8 @@ class HarremanAnalysis:
         layer_key_np_test: str | None = None,
         device: str | None = None,
         verbose: bool = False,
+        pval_ties: Literal["inclusive", "strict"] = "inclusive",
+        min_cells_per_cell_type: int | None = None,
     ) -> None:
         """Compute ligand-receptor / metabolite CCC scores.
 
@@ -440,6 +442,14 @@ class HarremanAnalysis:
             PyTorch device string. ``None`` uses the underlying default.
         verbose
             Print progress.
+        pval_ties
+            ``"inclusive"`` (default): standard permutation p-value,
+            (#(perm >= obs) + 1) / (M + 1). ``"strict"``: counts only perm > obs, the behavior up
+            to scviva-tools 0.1.7, which gives interactions with no co-expression the minimum
+            p-value; only to reproduce old results.
+        min_cells_per_cell_type
+            ``mode="cell_type"`` only: test a gene pair only if its genes are detected in at least
+            this many cells of their cell types (see ``compute_ct_cell_communication``).
         """
         self._require(STEP_CCC)
         if mode not in ("standard", "cell_type"):
@@ -462,13 +472,19 @@ class HarremanAnalysis:
             "mean": mean,
             "device": device,
             "verbose": verbose,
+            "pval_ties": pval_ties,
         }
         if mode == "cell_type":
             _compute_ct_cell_communication(
                 **kwargs,
                 cell_type_key=self._adata.uns[HARREMAN_UNS_KEY].get("cell_type_key"),
+                min_cells_per_cell_type=min_cells_per_cell_type,
             )
         else:
+            if min_cells_per_cell_type is not None:
+                raise ValueError(
+                    '"min_cells_per_cell_type" is only available with mode="cell_type".'
+                )
             _compute_cell_communication(**kwargs)
 
         self._ccc_mode = mode
@@ -483,6 +499,7 @@ class HarremanAnalysis:
         seed: int = 42,
         device: str | None = None,
         verbose: bool = False,
+        pval_ties: Literal["inclusive", "strict"] = "inclusive",
     ) -> None:
         """Compute per-cell interaction scores.
 
@@ -504,6 +521,9 @@ class HarremanAnalysis:
             PyTorch device string.
         verbose
             Print progress.
+        pval_ties
+            Tie handling of the permutation test (``mode="standard"`` only); see
+            ``compute_cell_communication``.
         """
         self._require(STEP_ICS)
         if mode not in ("standard", "cell_type"):
@@ -536,6 +556,7 @@ class HarremanAnalysis:
                 seed=seed,
                 device=device,
                 verbose=verbose,
+                pval_ties=pval_ties,
             )
         self._completed_steps.add(STEP_ICS)
 

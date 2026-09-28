@@ -16,7 +16,13 @@ from scviva.tools.harreman.tools.knn import make_weights_non_redundant
 from scviva.utils import resolve_device, stats_dtype
 
 from ._metabolite_scoring import compute_metabolite_cs
-from ._stats import compute_max_cs, flatten, z_to_pval_fdr
+from ._stats import (
+    check_pval_ties,
+    compute_max_cs,
+    flatten,
+    permutation_exceedances,
+    z_to_pval_fdr,
+)
 
 
 def compute_cell_communication(
@@ -33,6 +39,7 @@ def compute_cell_communication(
     check_analytic_null: bool | None = False,
     device: torch.device | str = "auto",
     verbose: bool | None = False,
+    pval_ties: Literal["inclusive", "strict"] = "inclusive",
 ) -> None:
     """Compute spatially informed cell-type-agnostic CCC scores.
 
@@ -75,6 +82,12 @@ def compute_cell_communication(
         PyTorch device to run computations on. Defaults to CUDA if available.
     verbose : bool, optional (default: False)
         Whether to print progress and status messages.
+    pval_ties : {'inclusive', 'strict'}, optional (default: 'inclusive')
+        How the non-parametric test counts permuted scores equal to the observed score.
+        ``'inclusive'`` gives the standard permutation p-value, (#(perm >= obs) + 1) / (M + 1).
+        ``'strict'`` counts only perm > obs, the behavior up to scviva-tools 0.1.7: interactions
+        with no co-expression (observed and permuted scores all 0) then get the minimum p-value,
+        which inflates significance. Use it only to reproduce earlier results.
 
     Returns
     -------
@@ -108,6 +121,7 @@ def compute_cell_communication(
     adata.uns["model"] = model
     adata.uns["center_counts_for_np_test"] = center_counts_for_np_test
     adata.uns["mean"] = mean
+    adata.uns["pval_ties"] = check_pval_ties(pval_ties)
 
     run_cell_communication_analysis(
         adata,
@@ -123,6 +137,7 @@ def compute_cell_communication(
         check_analytic_null,
         device,
         verbose,
+        pval_ties=pval_ties,
     )
 
     if verbose:
@@ -161,6 +176,7 @@ def run_cell_communication_analysis(
     check_analytic_null: bool | None,
     device: torch.device | str,
     verbose: bool | None,
+    pval_ties: Literal["inclusive", "strict"] = "inclusive",
 ) -> None:
     """Run the cell-type-agnostic CCC score and significance workflow."""
     # `obs_names` never differs between `adata` and `adata.raw`, and `Raw` has
@@ -493,10 +509,10 @@ def run_cell_communication_analysis(
         adata.uns["ccc_results"]["np"]["m"]["perm_cs_a"] = perm_cs_m_a.detach().cpu().numpy()
         adata.uns["ccc_results"]["np"]["m"]["perm_cs_b"] = perm_cs_m_b.detach().cpu().numpy()
 
-        x_gp_a = (perm_cs_gp_a > cs_gp[:, None]).sum(dim=1)
-        x_gp_b = (perm_cs_gp_b > cs_gp[:, None]).sum(dim=1)
-        x_m_a = (perm_cs_m_a > cs_m[:, None]).sum(dim=1)
-        x_m_b = (perm_cs_m_b > cs_m[:, None]).sum(dim=1)
+        x_gp_a = permutation_exceedances(perm_cs_gp_a, cs_gp[:, None], pval_ties).sum(dim=1)
+        x_gp_b = permutation_exceedances(perm_cs_gp_b, cs_gp[:, None], pval_ties).sum(dim=1)
+        x_m_a = permutation_exceedances(perm_cs_m_a, cs_m[:, None], pval_ties).sum(dim=1)
+        x_m_b = permutation_exceedances(perm_cs_m_b, cs_m[:, None], pval_ties).sum(dim=1)
 
         pvals_gp_a = (x_gp_a + 1).float() / (M + 1)
         pvals_gp_b = (x_gp_b + 1).float() / (M + 1)
@@ -614,6 +630,7 @@ def compute_interacting_cell_scores(
     check_analytic_null: bool | None = False,
     device: torch.device | str = "auto",
     verbose: bool | None = False,
+    pval_ties: Literal["inclusive", "strict"] = "inclusive",
 ) -> None:
     """
     Compute interacting cell scores for gene pairs and metabolites.
@@ -644,6 +661,12 @@ def compute_interacting_cell_scores(
         CPU or GPU device for tensor operations.
     verbose : bool, default False
         Print status updates.
+    pval_ties : {'inclusive', 'strict'}, optional (default: 'inclusive')
+        How the non-parametric test counts permuted scores equal to the observed score.
+        ``'inclusive'`` gives the standard permutation p-value, (#(perm >= obs) + 1) / (M + 1).
+        ``'strict'`` counts only perm > obs, the behavior up to scviva-tools 0.1.7: interactions
+        with no co-expression (observed and permuted scores all 0) then get the minimum p-value,
+        which inflates significance. Use it only to reproduce earlier results.
 
     Returns
     -------
@@ -652,6 +675,7 @@ def compute_interacting_cell_scores(
     """
     start = time.time()
     device = resolve_device(device)
+    check_pval_ties(pval_ties)
     if verbose:
         print("Computing gene pair and metabolite scores...")
 
@@ -1061,10 +1085,10 @@ def compute_interacting_cell_scores(
                 perm_cs_m_b.detach().cpu().numpy()
             )
 
-            x_gp_a = (perm_cs_gp_a > cs_gp[:, :, None]).sum(dim=2)
-            x_gp_b = (perm_cs_gp_b > cs_gp[:, :, None]).sum(dim=2)
-            x_m_a = (perm_cs_m_a > cs_m[:, :, None]).sum(dim=2)
-            x_m_b = (perm_cs_m_b > cs_m[:, :, None]).sum(dim=2)
+            x_gp_a = permutation_exceedances(perm_cs_gp_a, cs_gp[:, :, None], pval_ties).sum(dim=2)
+            x_gp_b = permutation_exceedances(perm_cs_gp_b, cs_gp[:, :, None], pval_ties).sum(dim=2)
+            x_m_a = permutation_exceedances(perm_cs_m_a, cs_m[:, :, None], pval_ties).sum(dim=2)
+            x_m_b = permutation_exceedances(perm_cs_m_b, cs_m[:, :, None], pval_ties).sum(dim=2)
 
             pvals_gp_a = (x_gp_a + 1).float() / (M + 1)
             pvals_gp_b = (x_gp_b + 1).float() / (M + 1)
